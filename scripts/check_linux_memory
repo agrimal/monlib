@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+
+# Copyright © 2019 Aurélien Grimal
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#####
+
+# It is assumed that the /proc/meminfo file use kB as unit. If not, this program will not work.
+# Usage examples :
+# 1) check_linux_mem.py
+# 2) check_linux_mem.py --mem-warn 0.55 --mem-crit 0.8 --swap-warn 0.5 --swap-crit 0.75
+
+#####
+
+
+import sys
+result = {'rc': 0, 'text': [], 'perfdata': [], 'params': {}}
+
+try:
+
+    import re, argparse, traceback
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--mem-warn",
+        help = "Threshold percent for memory warning (default 0.7)",
+        type = float,
+        default = 0.7
+    )
+    parser.add_argument(
+        "--mem-crit",
+        help = "Threshold percent for memory critical (default 0.9)",
+        type = float,
+        default = 0.9
+    )
+    parser.add_argument(
+        "--swap-warn",
+        help = "Threshold percent for memory warning (default 0.1)",
+        type = float,
+        default = 0.1,
+    )
+    parser.add_argument(
+        "--swap-crit",
+        help = "Threshold percent for memory critical (default 0.5)",
+        type = float,
+        default = 0.5
+    )
+    parser.add_argument(
+        "--without-swap",
+        help = "Deactivate swap monitoring",
+        action = "store_true"
+    )
+    parser.add_argument(
+        "--with-mem-locked",
+        help = "Activate memory locked monitoring",
+        action = "store_true"
+    )
+    parser.add_argument(
+        "--dont-use-available",
+        help = "Warn against used memory instead of not available memory",
+        action = "store_true"
+    )
+    parser.add_argument(
+        "--revert",
+        help = "Show output with free memory instead of used memory",
+        action = "store_true"
+    )
+    parser.add_argument(
+        "--unit",
+        help = "Unit for perfdata (default MB)",
+        choices = ['B', 'kB', 'MB', 'GB', 'TB'],
+        default = 'MB'
+    )
+
+    args = parser.parse_args()
+
+    error = False
+    if args.mem_warn < 0:
+        print("ERROR: --mem-warn can't be negative")
+        error = True
+    elif args.mem_warn > 1:
+        print("ERROR: --mem-warn value exceeds 1")
+        error = True
+    if args.swap_warn < 0:
+        print("ERROR: --swap-warn can't be negative")
+        error = True
+    elif args.swap_warn > 1:
+        print("ERROR: --swap-warn value exceeds 1")
+        error = True
+
+    if error:
+        sys.exit(2)
+
+    with open('/proc/meminfo', 'r') as meminfo:
+
+        # Define which params are read in the file
+        params = [
+            'MemTotal',
+            'MemFree',
+            'MemAvailable',
+            'Buffers',
+            'Cached',
+            'Mlocked'
+        ]
+
+        if args.with_mem_locked:
+            params.append('Mlocked')
+
+        if not args.without_swap:
+            params.append('SwapTotal')
+            params.append('SwapFree')
+
+        # Default value to -1 and compile regex
+        for param in params:
+            result['params'][param] = {
+                'value': -1,
+                'regex': re.compile('^' + param + ':\s+([0-9]+)\s+kB\s+$')
+            }
+
+        # Parse each line of the file
+        for line in meminfo:
+            for param, param_dict in result['params'].items():
+                re_result = param_dict['regex'].match(line)
+                if re_result is not None:
+                    param_dict['value'] = int(re_result.groups()[0])
+
+        # Detect if param is missing from file
+        for param, param_dict in result['params'].items():
+            if param_dict['value'] == -1:
+                print('ERROR: Missing parameter "' + param + '" in file /proc/meminfo')
+                error = True
+
+        # Exit if missing param
+        if error:
+            sys.exit(2)
+
+        # Analyze memory
+        result['params']['MemUsed'] = {
+            'value': result['params']['MemTotal']['value'] - result['params']['MemFree']['value']
+        }
+        result['params']['MemNotAvailable'] = {
+            'value': result['params']['MemTotal']['value'] - result['params']['MemAvailable']['value']
+        }
+
+        if args.dont_use_available:
+            mem_used_percent = round(
+                result['params']['MemUsed']['value'] / result['params']['MemTotal']['value'],
+                2
+            )
+        else:
+            mem_used_percent = round(
+                result['params']['MemNotAvailable']['value'] / result['params']['MemTotal']['value'],
+                2
+            )
+
+        if mem_used_percent > args.mem_warn:
+            if mem_used_percent > args.mem_crit:
+                result['rc'] = 2
+            else:
+                result['rc'] = 1
+            result['text'].append("Memory usage " + str(mem_used_percent * 100) + "%")
+
+        # Analyze swap
+        if not args.without_swap:
+            if result['params']['SwapTotal']['value'] != 0:
+                result['params']['SwapUsed'] = {
+                    'value': result['params']['SwapTotal']['value'] - result['params']['SwapFree']['value']
+                }
+                swap_used_percent = round(
+                    result['params']['SwapUsed']['value'] / result['params']['SwapTotal']['value'],
+                    2
+                )
+                if swap_used_percent > args.swap_warn:
+                    if swap_used_percent > args.swap_crit:
+                        result['rc'] = 2
+                    else:
+                        result['rc'] = 1
+                    result['text'].append("Swap usage " + str(swap_used_percent * 100) + "%")
+
+        #
+        # PERFDATA
+        #
+
+        # Convert units
+        for param, param_dict in result['params'].items():
+            if args.unit == 'B':
+                param_dict['value'] = param_dict['value'] * 1024
+            elif args.unit == 'MB':
+                param_dict['value'] = int(param_dict['value'] / 1024)
+            elif args.unit == 'GB':
+                param_dict['value'] = round(param_dict['value'] / 1024**2, 2)
+            elif args.unit == 'TB':
+                param_dict['value'] = round(param_dict['value'] / 1024**3, 2)
+
+        # MemUsed
+        value = result['params']['MemUsed']['value']
+        total_value = result['params']['MemTotal']['value']
+        string = 'mem_used=' + str(value) + args.unit + ';'
+        if args.dont_use_available:
+            string += str(round(total_value * args.mem_warn, 2)) + ';' + \
+                      str(round(total_value * args.mem_crit, 2)) + ';'
+        else:
+            string += ';;'
+        string += '0;' + str(total_value)
+        result['perfdata'].append(string)
+
+        # MemNotAvailable
+        value = result['params']['MemNotAvailable']['value']
+        string = 'mem_not_avail=' + str(value) + args.unit + ';'
+        if not args.dont_use_available:
+            string += str(round(total_value * args.mem_warn, 2)) + ';' + \
+                      str(round(total_value * args.mem_crit, 2)) + ';' 
+        else:
+            string += ';;'
+        string += '0;' + str(total_value)
+        result['perfdata'].append(string)
+
+        # Buffers + Cached
+        value = result['params']['Buffers']['value'] + result['params']['Cached']['value']
+        string = 'buffers_cached=' + str(value) + args.unit + ';;;0'
+        result['perfdata'].append(string)
+
+        # Mlocked
+        if args.with_mem_locked:
+            value = result['params']['Mlocked']['value']
+            string = 'mem_locked=' + str(value) + args.unit + ';;;0'
+            result['perfdata'].append(string)
+
+        # SwapUsed
+        if not args.without_swap:
+            value = result['params']['SwapUsed']['value']
+            total_value = result['params']['SwapTotal']['value']
+            string = 'swap_used=' + str(value) + args.unit + ';' + \
+                     str(round(total_value * args.swap_warn, 2)) + ';' + \
+                     str(round(total_value * args.swap_crit, 2)) + ';' + \
+                     '0;' + str(total_value)
+            result['perfdata'].append(string)
+
+        #
+        # OUTPUT AND EXIT
+        #
+
+        if result['rc'] == 0:
+            print("OK", end='')
+        elif result['rc'] == 1:
+            print("WARNING: ", " - ".join(result['text']), end='')
+        else:
+            print("CRITICAL: ", " - ".join(result['text']), end='')
+
+        print(" |", " ".join(result['perfdata']))
+
+except Exception:
+    print("CRITICAL:", traceback.format_exc())
+    print("\n".join(result['text']))
+    sys.exit(2)
