@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+# Copyright © 2019 Aurélien Grimal
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#####
+
+# Usage examples :
+# 1) 
+# 2) 
+
+#####
+
+import sys
+result = {'rc': 0, 'text': [], 'perfdata': [], 'values': {}}
+last_check_file = '/tmp/.monitoring/proc_stat'
+
+try:
+
+    import re, argparse, traceback, time, operator, os
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--warn",
+        help = "Threshold percent for warning (default 0.6)",
+        type = float,
+        default = 0.6
+    )
+    parser.add_argument(
+        "--crit",
+        help = "Threshold percent for critical (default 0.8)",
+        type = float,
+        default = 0.8
+    )
+    parser.add_argument(
+        "--all-cpus",
+        help = "Enable perfdata for each core",
+        action = 'store_true'
+    )
+
+    args = parser.parse_args()
+
+    error = False
+    if args.warn < 0:
+        print("ERROR: --warn can't be negative")
+        error = True
+    elif args.warn > 1:
+        print("ERROR: --warn value exceeds 1")
+        error = True
+    if args.crit < 0:
+        print("ERROR: --crit can't be negative")
+        error = True
+    elif args.crit > 1:
+        print("ERROR: --crit value exceeds 1")
+        error = True
+
+    if error:
+        sys.exit(2)
+
+    # /proc/stat cpu columns :
+    # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+    re_cpu = re.compile('^cpu\s+((?:\d+\s)+\d+)\s*$')
+    re_cpu_core = re.compile('^(cpu\d+)\s+((?:\d+\s)+\d+)\s*$')
+
+    def read_proc_stat(stat):
+        cpu_result = []
+        cpu_cores_result = {}
+        # Parse each line of the file
+        for line in stat:
+            # Do not check for '^cpu ' if it is already done
+            if len(cpu_result) == 0:
+                re_cpu_result = re_cpu.match(line)
+                if re_cpu_result is not None:
+                    cpu_result = re_cpu_result.group(1)
+                    if not args.all_cpus:
+                        break
+            # Check for '^cpu[0-9] '
+            else:
+                re_cpu_core_result = re_cpu_core.match(line)
+                if re_cpu_core_result is not None:
+                    cpu_cores_result[re_cpu_core_result.group(1)] = re_cpu_core_result.group(2)
+                # Do not check lines after '^cpu[0-9] '
+                else:
+                    break
+        return cpu_result, cpu_cores_result
+
+    # Read /proc/stat values registered from previous check
+    prev_cpu_result = []
+    prev_cpu_cores_result = {}
+    try:
+        with open(last_check_file, 'r') as stat:
+            prev_cpu_result, prev_cpu_cores_result = read_proc_stat(stat)
+            previous_check_file_exists = True
+    # If file is not present, do check on current /proc/stat file and wait 10 seconds
+    except IOError:
+        with open('/proc/stat', 'r') as stat:
+            prev_cpu_result, prev_cpu_cores_result = read_proc_stat(stat)
+            time.sleep(10)
+
+    # Read /proc/stat file
+    cpu_result = []
+    cpu_cores_result = {}
+    with open('/proc/stat', 'r') as stat:
+        cpu_result, cpu_cores_result = read_proc_stat(stat)
+        # Create directory that will store the results for the next check
+        try:
+            os.makedirs(os.path.dirname(last_check_file))
+        except FileExistsError:
+            pass
+        # Write results for the next check
+        with open(last_check_file, 'w') as stat:
+            stat.write('cpu ' + cpu_result + '\n')
+            for cpu_core, cpu_core_result in cpu_cores_result.items():
+                stat.write(cpu_core + ' ' + cpu_core_result + '\n')
+
+    # For the whole CPU
+    current_values = map(int, cpu_result.split(' '))
+    previous_values = map(int, prev_cpu_result.split(' '))
+    diff_values = list(map(operator.sub, current_values, previous_values))
+    total_time = 0
+    for i in range(8): # exclude guest and guest_nice because they are accounted in user and nice
+        total_time += diff_values[i]
+    total_usage = round((total_time - diff_values[3] - diff_values[4]) / total_time, 3)
+    if total_usage > args.warn:
+        if total_usage > args.crit:
+            result['rc'] = 2
+        else:
+            result['rc'] = 1
+        result['text'].append('CPU USAGE = ' + str(total_usage * 100) + '%')
+    result['values']['cpu'] = {
+        'total_usage': total_usage,
+        'user':        round(diff_values[0] / total_time, 3),
+        'nice':        round(diff_values[1] / total_time, 3),
+        'system':      round(diff_values[2] / total_time, 3),
+        'idle':        round(diff_values[3] / total_time, 3),
+        'iowait':      round(diff_values[4] / total_time, 3),
+        'irq':         round(diff_values[5] / total_time, 3),
+        'softirq':     round(diff_values[6] / total_time, 3),
+        'steal':       round(diff_values[7] / total_time, 3),
+        'guest':       round(diff_values[8] / total_time, 3),
+        'guest_nice':  round(diff_values[9] / total_time, 3)
+    }
+
+    # For each core
+    if args.all_cpus:
+        for cpu_core in cpu_cores_result:
+            if cpu_core in prev_cpu_cores_result:
+                current_values = map(int, cpu_cores_result[cpu_core].split(' '))
+                previous_values = map(int, prev_cpu_cores_result[cpu_core].split(' '))
+                diff_values = list(map(operator.sub, current_values, previous_values))
+                total_time = 0
+                for i in range(8): # exclude guest and guest_nice because they are accounted in user and nice
+                    total_time += diff_values[i]
+                idle_time = diff_values[3] + diff_values[4] # idle + iowait
+                result['values'][cpu_core] = {
+                    'total_usage': round((total_time - diff_values[3] - diff_values[4]) / total_time, 3),
+                    'user':        round(diff_values[0] / total_time, 3),
+                    'nice':        round(diff_values[1] / total_time, 3),
+                    'system':      round(diff_values[2] / total_time, 3),
+                    'idle':        round(diff_values[3] / total_time, 3),
+                    'iowait':      round(diff_values[4] / total_time, 3),
+                    'irq':         round(diff_values[5] / total_time, 3),
+                    'softirq':     round(diff_values[6] / total_time, 3),
+                    'steal':       round(diff_values[7] / total_time, 3),
+                    'guest':       round(diff_values[8] / total_time, 3),
+                    'guest_nice':  round(diff_values[9] / total_time, 3)
+                }
+
+    #
+    # PERFDATA
+    #
+
+    for cpu, keys in result['values'].items():
+        for key in keys:
+            string = key + '=' + str(keys[key]) + '%;'
+            if cpu == 'cpu' and key == 'total_usage':
+                string += str(args.warn) + ';' + str(args.crit) + ';'
+            else:
+                string += ';;'
+            string += '0;1'
+            result['perfdata'].append(string)
+
+    #
+    # OUTPUT AND EXIT
+    #
+
+    if result['rc'] == 0:
+        print("OK", end='')
+    elif result['rc'] == 1:
+        print("WARNING: ", " - ".join(result['text']), end='')
+    else:
+        print("CRITICAL: ", " - ".join(result['text']), end='')
+
+    print(" |", " ".join(result['perfdata']))
+
+except Exception:
+    print("CRITICAL:", traceback.format_exc())
+    print("\n".join(result['text']))
+    sys.exit(2)
