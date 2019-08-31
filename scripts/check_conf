@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+
+# Copyright © 2019 Aurélien Grimal
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#####
+
+# Usage examples :
+# 1) check_conf
+# 2) check_conf --copy-repo-to-local --force
+
+#####
+
+# Modules
+
+import sys
+
+try:
+    import hashlib, platform, os, shutil, argparse
+except Exception as e:
+    print("CRITICAL: cannot import modules", e)
+    sys.exit(2)
+
+# Variables
+
+config_dir = '/srv/git/conf'
+common_config_dir = 'common'
+hostname = platform.node()
+
+# Fonctions
+
+def hash_bytestr_iter(bytesiter, hasher, ashexstr=False):
+    for block in bytesiter:
+        hasher.update(block)
+    return hasher.hexdigest() if ashexstr else hasher.digest()
+
+def file_as_blockiter(afile, blocksize=65536):
+    with afile:
+        block = afile.read(blocksize)
+        while len(block) > 0:
+            yield block
+            block = afile.read(blocksize)
+
+def md5sum(file_path):
+    return hash_bytestr_iter(file_as_blockiter(open(file_path, 'rb')), hashlib.md5())
+
+def walk_git_conf(directory, level=1):
+    directory = directory.rstrip(os.path.sep)
+    assert os.path.isdir(directory)
+    num_sep = directory.count(os.path.sep)
+    for root_abs, dirs, files in os.walk(directory):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        num_sep_this = root_abs.count(os.path.sep)
+        if num_sep_this == 6:
+            root_rel = os.path.basename(root_abs)
+            if root_rel in [common_config_dir, hostname]:
+                yield root_abs
+        if num_sep + level <= num_sep_this:
+            del dirs[:]
+
+# Parsing of arguments
+
+parser = argparse.ArgumentParser(description='Script for monitoring / copying files between a local git repository and the local machine')
+
+exclusive_grp = parser.add_mutually_exclusive_group()
+
+exclusive_grp.add_argument('--copy-repo-to-local', action='store_true', help='Copy missing/different files from the git repository ' + config_dir + 'to the local machine.')
+exclusive_grp.add_argument('--copy-local-to-repo', action='store_true', help='Copy missing/different files from the local machine to the git repository ' + config_dir + '.')
+
+parser.add_argument('--force', action='store_true', help='Force copy, non-interactive mode - Be careful !')
+
+args = parser.parse_args()
+
+# List the valid directories containing files to compare
+# Valid directories must follow this pattern :
+# - {config_dir}/xxxxxxxx/conf/{common_config_dir}
+# - {config_dir}/xxxxxxxx/conf/{hostname}
+
+common_dirs = []
+host_dirs   = []
+for directory in walk_git_conf(config_dir, 3):
+    if os.path.basename(directory) == common_config_dir:
+        common_dirs.append(directory)
+    elif os.path.basename(directory) == hostname:
+        host_dirs.append(directory)
+    else:
+        print('CRITICAL: Internal error with directory', directory, 'found as config dir.')
+        sys.exit(2)
+
+conf_dirs = sorted(common_dirs) + sorted(host_dirs)
+
+# Store in dictionary each file to compare
+# Key : absolute path of the local file
+# Value : absolute path of the file in the git repository
+# Already found files are replaced by new ones in the alphabetical order of parsing 'conf_dirs' list
+
+git_conf_file_dict = {}
+for directory in conf_dirs:
+    len_dir = len(directory)
+    for item in os.walk(directory):
+        if len(item[2]) > 0:
+            for f in item[2]:
+                git_conf_file_dict.update({ item[0][len_dir:] + '/' + f : item[0] + '/' + f })
+
+# List missing and diferent files
+
+different_files_dict = {}
+missing_files_dict = {}
+
+for f_local, f_repo in git_conf_file_dict.items():
+    try:
+        local_md5 = md5sum(f_local)
+        repo_md5 = md5sum(f_repo)
+        if local_md5 != repo_md5:
+             different_files_dict.update({ f_local : f_repo })
+    except FileNotFoundError:
+        missing_files_dict.update({ f_local : f_repo })
+
+# Output
+
+len_diff = len(different_files_dict)
+len_miss = len(missing_files_dict)
+
+if len_diff + len_miss > 0:
+    # If copy
+    if args.copy_repo_to_local or args.copy_local_to_repo:
+        # If there are missing files
+        if len_miss > 0:
+            for f_local, f_repo in missing_files_dict.items():
+                if args.copy_local_to_repo:
+                    print("ERROR: Can't copy non-existant file", f_local, "to", f_repo)
+                else:
+                    if not args.force:
+                        print("\nPlease confirm the execution of the following command :")
+                        print("cp", f_repo, f_local)
+                        answer = input("Your answer ([yes|no]) : ")
+                    if args.force or answer in ['y', 'yes']:
+                        shutil.copy2(f_repo, f_local)
+                        print("Copy done")
+                    else:
+                        print("Skipping this file")
+        # If there are different files
+        if len_diff > 0:
+            for f_local, f_repo in different_files_dict.items():
+                if not args.force:
+                    print("\nPlease confirm the execution of the following command :")
+                    if args.copy_local_to_repo:
+                        print("cp", f_local, f_repo)
+                    else:
+                        print("cp", f_repo, f_local)
+                    answer = input("Your answer ([yes|no]) : ")
+                if args.force or answer in ['y', 'yes']:
+                    if args.copy_local_to_repo:
+                        shutil.copy2(f_local, f_repo)
+                        print("Copy done")
+                    else:
+                        shutil.copy2(f_repo, f_local)
+                        print("Copy done")
+                else:
+                    print("Skipping this file")
+    # Else : just monitoring
+    else:
+        print("CRITICAL - ", end='')
+        if len_miss > 0:
+            print(len_miss, "missing files", end='')
+        if len_diff > 0:
+            if len_miss > 0:
+                print(" and ", end='')
+            print(len_diff, "different files")
+        if len_miss > 0:
+            print("\nMissing files :")
+            for f_local, f_repo in missing_files_dict.items():
+                print("- repo  :", f_repo)
+                print("  local :", f_local)
+        if len_diff > 0:
+            print("\nDifferent files :")
+            for f_local, f_repo in different_files_dict.items():
+                print("- repo  :", f_repo)
+                print("  local :", f_local)
+        sys.exit(2)
+else:
+    print("OK")
+    sys.exit(0)
+
